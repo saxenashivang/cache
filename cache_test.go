@@ -9,8 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gin-contrib/cache/persistence"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/saxenashivang/cache/persistence"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -303,6 +304,43 @@ func performRequest(method, target string, router *gin.Engine) *httptest.Respons
 	return w
 }
 
+func TestCachePageWithContextKey(t *testing.T) {
+	store := persistence.NewInMemoryStore(60 * time.Second)
+
+	router := gin.New()
+	router.Use(AddUserId())
+	key := "userId"
+	router.GET("/cache_ping", CachePageWithContextKey(store, time.Second*3, key, func(c *gin.Context) {
+		c.String(200, "pong "+fmt.Sprint(time.Now().UnixNano()))
+	}))
+
+	w1 := performRequest("GET", "/cache_ping", router)
+	w2 := performRequest("GET", "/cache_ping", router)
+
+	assert.Equal(t, 200, w1.Code)
+	assert.Equal(t, 200, w2.Code)
+	assert.Equal(t, w1.Body.String(), w2.Body.String())
+}
+
+func TestCachePageWithContextKeyExpire(t *testing.T) {
+	store := persistence.NewInMemoryStore(60 * time.Second)
+
+	router := gin.New()
+	router.Use(AddUserId())
+	key := "userId"
+	router.GET("/cache_ping", CachePageWithContextKey(store, time.Second, key, func(c *gin.Context) {
+		c.String(200, "pong "+fmt.Sprint(time.Now().UnixNano()))
+	}))
+
+	w1 := performRequest("GET", "/cache_ping", router)
+	time.Sleep(time.Second * 2)
+	w2 := performRequest("GET", "/cache_ping", router)
+
+	assert.Equal(t, 200, w1.Code)
+	assert.Equal(t, 200, w2.Code)
+	assert.NotEqual(t, w1.Body.String(), w2.Body.String())
+}
+
 type memoryDelayStore struct {
 	*persistence.InMemoryStore
 }
@@ -321,4 +359,12 @@ func (c *memoryDelayStore) Set(key string, value interface{}, expires time.Durat
 func (c *memoryDelayStore) Add(key string, value interface{}, expires time.Duration) error {
 	time.Sleep(time.Millisecond * 3)
 	return c.InMemoryStore.Add(key, value, expires)
+}
+
+func AddUserId() func(*gin.Context) {
+	return func(c *gin.Context) {
+		uuid := uuid.New().String()
+		// Set a new key in the context
+		c.Set("userId", uuid)
+	}
 }

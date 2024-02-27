@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"github.com/saxenashivang/cache/persistence"
 	"github.com/stretchr/testify/assert"
 )
@@ -34,6 +33,7 @@ func TestWrite(t *testing.T) {
 	c.Writer.WriteHeader(204)
 	c.Writer.WriteHeaderNow()
 	_, _ = c.Writer.Write([]byte("foo"))
+	writer.Close()
 	assert.Equal(t, 204, c.Writer.Status())
 	assert.Equal(t, "foo", w.Body.String())
 	assert.True(t, c.Writer.Written())
@@ -304,13 +304,28 @@ func performRequest(method, target string, router *gin.Engine) *httptest.Respons
 	return w
 }
 
+func TestCacheCustom(t *testing.T) {
+	store := persistence.NewInMemoryStore(60 * time.Second)
+
+	router := gin.New()
+	router.GET("/cache_ping", CacheCustom(store, time.Second*3, func(c *gin.Context) {
+		c.String(200, "pong "+fmt.Sprint(time.Now().UnixNano()))
+	}, RequestURIKey, WriteWithHeaders))
+
+	w1 := performRequest("GET", "/cache_ping", router)
+	w2 := performRequest("GET", "/cache_ping", router)
+
+	assert.Equal(t, 200, w1.Code)
+	assert.Equal(t, 200, w2.Code)
+	assert.Equal(t, w1.Body.String(), w2.Body.String())
+}
+
 func TestCachePageWithContextKey(t *testing.T) {
 	store := persistence.NewInMemoryStore(60 * time.Second)
 
 	router := gin.New()
-	router.Use(AddUserId())
-	key := "userId"
-	router.GET("/cache_ping", CachePageWithContextKey(store, time.Second*3, key, func(c *gin.Context) {
+	router.Use(AddUniqueCacheKey())
+	router.GET("/cache_ping", CachePageWithContextKey(store, time.Second*3, func(c *gin.Context) {
 		c.String(200, "pong "+fmt.Sprint(time.Now().UnixNano()))
 	}))
 
@@ -326,9 +341,8 @@ func TestCachePageWithContextKeyExpire(t *testing.T) {
 	store := persistence.NewInMemoryStore(60 * time.Second)
 
 	router := gin.New()
-	router.Use(AddUserId())
-	key := "userId"
-	router.GET("/cache_ping", CachePageWithContextKey(store, time.Second, key, func(c *gin.Context) {
+	router.Use(AddUniqueCacheKey())
+	router.GET("/cache_ping", CachePageWithContextKey(store, time.Second, func(c *gin.Context) {
 		c.String(200, "pong "+fmt.Sprint(time.Now().UnixNano()))
 	}))
 
@@ -361,10 +375,10 @@ func (c *memoryDelayStore) Add(key string, value interface{}, expires time.Durat
 	return c.InMemoryStore.Add(key, value, expires)
 }
 
-func AddUserId() func(*gin.Context) {
+func AddUniqueCacheKey() func(*gin.Context) {
 	return func(c *gin.Context) {
-		uuid := uuid.New().String()
+		uuid := "fixed_key"
 		// Set a new key in the context
-		c.Set("userId", uuid)
+		c.Set("unique_cache_key", uuid)
 	}
 }

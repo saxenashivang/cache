@@ -2,13 +2,17 @@ package cache
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/sha1"
+	"encoding/base64"
 	"encoding/gob"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,12 +41,20 @@ func RegisterResponseCacheGob() {
 
 type cachedWriter struct {
 	gin.ResponseWriter
+	buffer  *bytes.Buffer
 	status  int
 	written bool
+	aborted bool
 	store   persistence.CacheStore
 	expire  time.Duration
 	key     string
 }
+
+type KeyGenerator func(c *gin.Context) string
+
+type WriterHook func(c *gin.Context, cache responseCache)
+
+type Middleware func(store persistence.CacheStore, expire time.Duration, handle gin.HandlerFunc) gin.HandlerFunc
 
 var _ gin.ResponseWriter = &cachedWriter{}
 
@@ -51,22 +63,22 @@ func CreateKey(u string) string {
 	return urlEscape(PageCachePrefix, u)
 }
 
-func urlEscape(prefix string, u string) string {
-	key := url.QueryEscape(u)
-	if len(key) > 200 {
-		h := sha1.New()
-		_, _ = io.WriteString(h, u)
-		key = string(h.Sum(nil))
+func newCachedWriter(
+	store persistence.CacheStore,
+	expire time.Duration,
+	writer gin.ResponseWriter,
+	key string,
+) *cachedWriter {
+	return &cachedWriter{
+		writer,
+		bytes.NewBuffer([]byte{}),
+		0,
+		false,
+		false,
+		store,
+		expire,
+		key,
 	}
-	var buffer bytes.Buffer
-	buffer.WriteString(prefix)
-	buffer.WriteString(":")
-	buffer.WriteString(key)
-	return buffer.String()
-}
-
-func newCachedWriter(store persistence.CacheStore, expire time.Duration, writer gin.ResponseWriter, key string) *cachedWriter {
-	return &cachedWriter{writer, 0, false, store, expire, key}
 }
 
 func (w *cachedWriter) WriteHeader(code int) {
@@ -84,45 +96,41 @@ func (w *cachedWriter) Written() bool {
 }
 
 func (w *cachedWriter) Write(data []byte) (int, error) {
-	ret, err := w.ResponseWriter.Write(data)
-	if err == nil {
-		store := w.store
-		var cache responseCache
-		if err := store.Get(w.key, &cache); err == nil {
-			cache.Data = append(cache.Data, data...)
-		} else {
-			cache.Data = make([]byte, 0)
-			cache.Data = append(cache.Data, data...)
-		}
-		//cache responses with a status code < 300
-		if w.Status() < 300 {
-			val := responseCache{
-				w.Status(),
-				w.Header(),
-				cache.Data,
-			}
-			err = store.Set(w.key, val, w.expire)
-			// if err != nil {
-			// 	// need logger
-			// }
-		}
-	}
-	return ret, err
+	return w.buffer.Write(data)
 }
 
 func (w *cachedWriter) WriteString(data string) (n int, err error) {
-	ret, err := w.ResponseWriter.WriteString(data)
-	//cache responses with a status code < 300
-	if err == nil && w.Status() < 300 {
-		store := w.store
-		val := responseCache{
-			w.Status(),
-			w.Header(),
-			[]byte(data),
-		}
-		_ = store.Set(w.key, val, w.expire)
+	return w.buffer.WriteString(data)
+}
+
+func (w *cachedWriter) Close() error {
+	val := responseCache{
+		w.Status(),
+		w.Header(),
+		w.readCompressed(w.buffer.Bytes()),
 	}
-	return ret, err
+	w.ResponseWriter.Write(val.Data)
+	if w.Status() >= 300 || w.aborted {
+		return nil
+	}
+	return w.store.Set(w.key, val, w.expire)
+}
+
+func (w *cachedWriter) Abort() {
+	w.aborted = true
+}
+
+func (w *cachedWriter) readCompressed(data []byte) []byte {
+	if strings.Contains(w.ResponseWriter.Header().Get("Content-Encoding"), "gzip") {
+		if reader, err := gzip.NewReader(bytes.NewReader(data)); err != nil {
+			fmt.Println(err.Error())
+		} else if b, err := ioutil.ReadAll(reader); err != nil {
+			fmt.Println(err.Error())
+		} else {
+			return b
+		}
+	}
+	return data
 }
 
 // Cache Middleware
@@ -136,82 +144,60 @@ func Cache(store *persistence.CacheStore) gin.HandlerFunc {
 func SiteCache(store persistence.CacheStore, expire time.Duration) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var cache responseCache
-		url := c.Request.URL
-		key := CreateKey(url.RequestURI())
-		if err := store.Get(key, &cache); err != nil {
+		if err := store.Get(RequestURIKey(c), &cache); err != nil {
 			c.Next()
 		} else {
-			c.Writer.WriteHeader(cache.Status)
-			for k, vals := range cache.Header {
-				for _, v := range vals {
-					c.Writer.Header().Set(k, v)
-				}
-			}
-			_, _ = c.Writer.Write(cache.Data)
+			WriteWithHeaders(c, cache)
 		}
 	}
+}
+
+func CacheCustom(
+	store persistence.CacheStore,
+	expire time.Duration,
+	handle gin.HandlerFunc,
+	keyGenerator KeyGenerator,
+	writerHook WriterHook,
+) gin.HandlerFunc {
+	return handleCache(store, expire, handle, keyGenerator, writerHook)
 }
 
 // CachePage Decorator
 func CachePage(store persistence.CacheStore, expire time.Duration, handle gin.HandlerFunc) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		var cache responseCache
-		url := c.Request.URL
-		key := CreateKey(url.RequestURI())
-		if err := store.Get(key, &cache); err != nil {
-			if err != persistence.ErrCacheMiss {
-				log.Println(err.Error())
-			}
-			// replace writer
-			writer := newCachedWriter(store, expire, c.Writer, key)
-			c.Writer = writer
-			handle(c)
-
-			// Drop caches of aborted contexts
-			if c.IsAborted() {
-				_ = store.Delete(key)
-			}
-		} else {
-			c.Writer.WriteHeader(cache.Status)
-			for k, vals := range cache.Header {
-				for _, v := range vals {
-					c.Writer.Header().Set(k, v)
-				}
-			}
-			_, _ = c.Writer.Write(cache.Data)
-		}
-	}
+	return handleCache(store, expire, handle, RequestURIKey, WriteWithHeaders)
 }
 
 // CachePageWithoutQuery add ability to ignore GET query parameters.
 func CachePageWithoutQuery(store persistence.CacheStore, expire time.Duration, handle gin.HandlerFunc) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		var cache responseCache
-		key := CreateKey(c.Request.URL.Path)
-		if err := store.Get(key, &cache); err != nil {
-			if err != persistence.ErrCacheMiss {
-				log.Println(err.Error())
-			}
-			// replace writer
-			writer := newCachedWriter(store, expire, c.Writer, key)
-			c.Writer = writer
-			handle(c)
-		} else {
-			c.Writer.WriteHeader(cache.Status)
-			for k, vals := range cache.Header {
-				for _, v := range vals {
-					c.Writer.Header().Set(k, v)
-				}
-			}
-			_, _ = c.Writer.Write(cache.Data)
-		}
-	}
+	return handleCache(store, expire, handle, WithoutParamKey, WriteWithHeaders)
+}
+
+// CachePageWithBodyKey will cache a page with query parameters and a base64 string of the body content
+func CachePageWithBodyKey(store persistence.CacheStore, expire time.Duration, handle gin.HandlerFunc) gin.HandlerFunc {
+	return handleCache(store, expire, handle, WithBodyKey, WriteWithHeaders)
+}
+func CachePageWithoutHeader(store persistence.CacheStore, expire time.Duration, handle gin.HandlerFunc) gin.HandlerFunc {
+	return handleCache(store, expire, handle, RequestURIKey, WriteWithoutHeaders)
+}
+
+func CachePageAtomic(store persistence.CacheStore, expire time.Duration, handle gin.HandlerFunc) gin.HandlerFunc {
+	return CachePageAtomicDecorator(CachePage, store, expire, handle)
+}
+
+// CachePageWithContextKey Accept a context key to create a unique cache key
+func CachePageWithContextKey(store persistence.CacheStore, expire time.Duration, handle gin.HandlerFunc) gin.HandlerFunc {
+	return handleCache(store, expire, handle, RequestContextKey, WriteWithHeaders)
 }
 
 // CachePageAtomic Decorator
-func CachePageAtomic(store persistence.CacheStore, expire time.Duration, handle gin.HandlerFunc) gin.HandlerFunc {
+func CachePageAtomicDecorator(
+	middleware Middleware,
+	store persistence.CacheStore,
+	expire time.Duration,
+	handle gin.HandlerFunc,
+) gin.HandlerFunc {
 	var m sync.Mutex
-	p := CachePage(store, expire, handle)
+	p := middleware(store, expire, handle)
 	return func(c *gin.Context) {
 		m.Lock()
 		defer m.Unlock()
@@ -219,64 +205,99 @@ func CachePageAtomic(store persistence.CacheStore, expire time.Duration, handle 
 	}
 }
 
-func CachePageWithoutHeader(store persistence.CacheStore, expire time.Duration, handle gin.HandlerFunc) gin.HandlerFunc {
+func WriteWithHeaders(c *gin.Context, cache responseCache) {
+	for k, vals := range cache.Header {
+		for _, v := range vals {
+			c.Writer.Header().Set(k, v)
+		}
+	}
+	WriteWithoutHeaders(c, cache)
+}
+
+func WriteWithoutHeaders(c *gin.Context, cache responseCache) {
+	c.Writer.WriteHeader(cache.Status)
+	c.Writer.Write(cache.Data)
+}
+
+func RequestURIKey(c *gin.Context) string {
+	return CreateKey(c.Request.URL.RequestURI())
+}
+
+func WithoutParamKey(c *gin.Context) string {
+	return CreateKey(c.Request.URL.Path)
+}
+
+func RequestContextKey(c *gin.Context) string {
+	key := CreateKey(c.Request.URL.Path)
+	ctxKey, exists := c.Get("unique_cache_key")
+	if !exists {
+		log.Println("cache key not found in context")
+	} else {
+		key = fmt.Sprintf("%s:%s", key, ctxKey)
+	}
+	return key
+}
+
+func WithBodyKey(c *gin.Context) string {
+	body, _ := ioutil.ReadAll(c.Request.Body)
+	trimmed := strings.TrimSpace(string(body))
+	c.Request.Body = ioutil.NopCloser(bytes.NewReader(body))
+	return CreateKey(fmt.Sprintf(
+		"%s.%s",
+		c.Request.URL.RequestURI(),
+		base64.StdEncoding.EncodeToString([]byte(trimmed)),
+	))
+}
+
+func handleCache(
+	store persistence.CacheStore,
+	expire time.Duration,
+	handle gin.HandlerFunc,
+	keyGenerator KeyGenerator,
+	writerHook WriterHook,
+) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var cache responseCache
-		url := c.Request.URL
-		key := CreateKey(url.RequestURI())
-		if err := store.Get(key, &cache); err != nil {
-			if err != persistence.ErrCacheMiss {
-				log.Println(err.Error())
-			}
-			// replace writer
-			writer := newCachedWriter(store, expire, c.Writer, key)
-			c.Writer = writer
-			handle(c)
-
-			// Drop caches of aborted contexts
-			if c.IsAborted() {
-				_ = store.Delete(key)
-			}
+		key := keyGenerator(c)
+		err := store.Get(key, &cache)
+		if err != nil && err != persistence.ErrCacheMiss {
+			log.Println(err.Error())
+		} else if err == nil {
+			writerHook(c, cache)
 		} else {
-			c.Writer.WriteHeader(cache.Status)
-			_, _ = c.Writer.Write(cache.Data)
+			callHandle(c, handle, store, expire, key)
 		}
 	}
 }
 
-// CachePageWithContextKey Accept a context key to create a unique cache key
-func CachePageWithContextKey(store persistence.CacheStore, expire time.Duration, contextKey string, handle gin.HandlerFunc) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		var cache responseCache
-		url := c.Request.URL
-		key := CreateKey(url.RequestURI())
-		ctxKey, exists := c.Get(contextKey)
-		if !exists {
-			log.Println("contextKey not found in context")
-		} else {
-			key = fmt.Sprintf("%s:%s", key, ctxKey)
-		}
-		if err := store.Get(key, &cache); err != nil {
-			if err != persistence.ErrCacheMiss {
-				log.Println(err.Error())
-			}
-			// replace writer
-			writer := newCachedWriter(store, expire, c.Writer, key)
-			c.Writer = writer
-			handle(c)
+func callHandle(
+	c *gin.Context,
+	handle gin.HandlerFunc,
+	store persistence.CacheStore,
+	expire time.Duration,
+	key string,
+) {
+	writer := newCachedWriter(store, expire, c.Writer, key)
+	c.Writer = writer
+	handle(c)
 
-			// Drop caches of aborted contexts
-			if c.IsAborted() {
-				_ = store.Delete(key)
-			}
-		} else {
-			c.Writer.WriteHeader(cache.Status)
-			for k, vals := range cache.Header {
-				for _, v := range vals {
-					c.Writer.Header().Set(k, v)
-				}
-			}
-			_, _ = c.Writer.Write(cache.Data)
-		}
+	c.Next()
+	if c.IsAborted() {
+		writer.Abort()
 	}
+	writer.Close()
+}
+
+func urlEscape(prefix string, u string) string {
+	key := url.QueryEscape(u)
+	if len(key) > 200 {
+		h := sha1.New()
+		io.WriteString(h, u)
+		key = string(h.Sum(nil))
+	}
+	var buffer bytes.Buffer
+	buffer.WriteString(prefix)
+	buffer.WriteString(":")
+	buffer.WriteString(key)
+	return buffer.String()
 }
